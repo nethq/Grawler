@@ -6,13 +6,11 @@ import re
 import subprocess
 import sys
 import getpass
-import requests
 
 # ----------------------------
-# Helper functions for Git
+# Git Helpers
 # ----------------------------
 def run_git_command(cmd):
-    """Run a git command and return its output."""
     try:
         result = subprocess.check_output(["git"] + cmd, stderr=subprocess.STDOUT)
         return result.decode().strip()
@@ -21,15 +19,12 @@ def run_git_command(cmd):
         sys.exit(1)
 
 def get_current_commit():
-    """Return the current commit hash (HEAD)."""
     return run_git_command(["rev-parse", "HEAD"])
 
 def get_commit_message(commit_hash):
-    """Return the commit message for a given commit hash."""
     return run_git_command(["log", "-1", "--pretty=%B", commit_hash])
 
 def extract_change_id(commit_message):
-    """Extract Gerrit Change-Id from the commit message."""
     match = re.search(r'Change-Id:\s*(I[a-f0-9]+)', commit_message)
     if match:
         return match.group(1)
@@ -37,72 +32,46 @@ def extract_change_id(commit_message):
         return None
 
 # ----------------------------
-# Gerrit REST API functions
+# SSH Query Functions
 # ----------------------------
-def query_change_rest(gerrit_config, query_param):
+def query_change_ssh(gerrit_config, query_param):
     """
-    Query Gerrit for a change using the given query parameter.
-    Returns a list of changes (could be empty).
+    Uses SSH to run:
+      ssh -p <port> <user>@<host> gerrit query --patch-sets --comments --format=JSON <query_param>
+    Returns a list of change objects (skipping the final stats object).
     """
-    base_url = gerrit_config.get("base_url").rstrip("/")
-    url = f"{base_url}/changes/?q={query_param}&o=ALL_REVISIONS"
-    auth = None
-    if "username" in gerrit_config and "password" in gerrit_config:
-        auth = (gerrit_config["username"], gerrit_config["password"])
+    ssh_host = gerrit_config.get("ssh_host")
+    ssh_port = str(gerrit_config.get("ssh_port", "29418"))
+    ssh_user = gerrit_config.get("ssh_user")
+    if not ssh_host or not ssh_user:
+        print("SSH configuration (ssh_host and ssh_user) missing in config.")
+        sys.exit(1)
+    cmd = [
+        "ssh", "-p", ssh_port,
+        f"{ssh_user}@{ssh_host}",
+        "gerrit", "query", "--patch-sets", "--comments", "--format=JSON", query_param
+    ]
     try:
-        resp = requests.get(url, auth=auth)
-        if resp.status_code != 200:
-            print(f"Error: Received status code {resp.status_code} from Gerrit")
-            sys.exit(1)
-        # Gerrit REST responses start with ")]}'" – remove it.
-        text = re.sub(r"^\)\]\}'\n", "", resp.text)
-        data = json.loads(text)
-        return data
-    except Exception as e:
-        print("Error querying Gerrit:", e)
+        result = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        output_lines = result.decode().strip().splitlines()
+        changes = []
+        for line in output_lines:
+            if line.strip():
+                try:
+                    obj = json.loads(line)
+                    if "rowCount" in obj:  # skip the stats line
+                        continue
+                    changes.append(obj)
+                except json.JSONDecodeError as e:
+                    print("Error decoding JSON:", e)
+        return changes
+    except subprocess.CalledProcessError as e:
+        print("SSH command failed:", e.output.decode())
         sys.exit(1)
 
-def fetch_comments_rest(gerrit_config, change_number, revision):
-    """
-    For a given change (by its Gerrit numeric ID) and revision (commit hash),
-    fetch inline comments and change messages.
-    """
-    base_url = gerrit_config.get("base_url").rstrip("/")
-    auth = None
-    if "username" in gerrit_config and "password" in gerrit_config:
-        auth = (gerrit_config["username"], gerrit_config["password"])
-    # Inline comments endpoint:
-    url_inline = f"{base_url}/changes/{change_number}/revisions/{revision}/comments"
-    # Change messages endpoint:
-    url_messages = f"{base_url}/changes/{change_number}/messages"
-    try:
-        resp_inline = requests.get(url_inline, auth=auth)
-        if resp_inline.status_code != 200:
-            print("Error fetching inline comments. Status:", resp_inline.status_code)
-            inline_comments = {}
-        else:
-            text_inline = re.sub(r"^\)\]\}'\n", "", resp_inline.text)
-            inline_comments = json.loads(text_inline)
-
-        resp_messages = requests.get(url_messages, auth=auth)
-        if resp_messages.status_code != 200:
-            print("Error fetching change messages. Status:", resp_messages.status_code)
-            messages = []
-        else:
-            text_messages = re.sub(r"^\)\]\}'\n", "", resp_messages.text)
-            messages = json.loads(text_messages)
-        return inline_comments, messages
-    except Exception as e:
-        print("Error fetching comments:", e)
-        sys.exit(1)
-
-# ----------------------------
-# Selection and formatting helpers
-# ----------------------------
-def select_change(changes, change_id):
-    """If multiple changes are found, prompt the user to select one."""
+def select_change(changes, query_value):
     if not changes:
-        print("No matching change found on Gerrit.")
+        print("No matching change found on Gerrit for query:", query_value)
         sys.exit(1)
     if len(changes) > 1:
         print("Multiple changes found:")
@@ -122,41 +91,47 @@ def select_change(changes, change_id):
 
 def select_patchset(change_info, chosen_patchset=None):
     """
-    Given change info (with a revisions dict), let the user select a patchset.
-    Returns a tuple: (patchset number, revision id, subject, created date)
+    For SSH output, patchsets are provided under the "patchSets" key.
+    Returns a tuple: (patchset number, revision id, created timestamp)
     """
-    revisions = change_info.get("revisions", {})
-    patchsets = []
-    for rev_id, rev_info in revisions.items():
-        number = rev_info.get("_number")
-        created = rev_info.get("created")
-        subject = rev_info.get("commit", {}).get("subject", "")
-        patchsets.append((number, rev_id, subject, created))
-    # Sort by patchset number
-    patchsets.sort(key=lambda x: x[0])
+    patchsets = change_info.get("patchSets", [])
+    if not patchsets:
+        print("No patchsets found in change info.")
+        sys.exit(1)
+    ps_list = []
+    for ps in patchsets:
+        # Use "number" (or _number) and "revision"
+        number = ps.get("number") or ps.get("_number")
+        revision = ps.get("revision")
+        created = ps.get("createdOn", "Unknown")
+        ps_list.append((number, revision, created))
+    # Sort by patchset number (as integer)
+    ps_list.sort(key=lambda x: int(x[0]))
     if chosen_patchset:
-        for ps in patchsets:
+        for ps in ps_list:
             if str(ps[0]) == str(chosen_patchset):
                 return ps
         print(f"Patchset {chosen_patchset} not found.")
         sys.exit(1)
-    if len(patchsets) == 1:
-        return patchsets[0]
+    if len(ps_list) == 1:
+        return ps_list[0]
     print("Available patchsets:")
-    for ps in patchsets:
-        print(f"Patchset {ps[0]}: revision {ps[1][:7]} - {ps[2]} (Created: {ps[3]})")
+    for ps in ps_list:
+        print(f"Patchset {ps[0]}: revision {ps[1][:7]} (Created: {ps[2]})")
     choice = input("Select patchset number (or press Enter for latest): ")
     if choice.strip() == "":
-        return patchsets[-1]
+        return ps_list[-1]
     else:
-        for ps in patchsets:
+        for ps in ps_list:
             if str(ps[0]) == choice.strip():
                 return ps
         print("Invalid patchset selection.")
         sys.exit(1)
 
+# ----------------------------
+# Output Formatting Functions
+# ----------------------------
 def format_json(inline_comments, messages, patchset_number):
-    """Return a JSON-formatted string with comments."""
     filtered_messages = [m for m in messages if str(m.get("_revision_number")) == str(patchset_number)]
     combined = {
         "inline_comments": inline_comments,
@@ -165,7 +140,6 @@ def format_json(inline_comments, messages, patchset_number):
     return json.dumps(combined, indent=2)
 
 def format_markdown(inline_comments, messages, patchset_number, change_number):
-    """Return a Markdown-formatted string with comments."""
     md = f"# Comments for Change {change_number}, Patchset {patchset_number}\n\n"
     filtered_messages = [m for m in messages if str(m.get("_revision_number")) == str(patchset_number)]
     if filtered_messages:
@@ -179,6 +153,7 @@ def format_markdown(inline_comments, messages, patchset_number, change_number):
     if inline_comments:
         md += "## Inline Comments\n"
         for file, comments in inline_comments.items():
+            # Only include comments for the chosen patchset.
             relevant = [c for c in comments if str(c.get("patch_set")) == str(patchset_number)]
             if relevant:
                 md += f"### File: {file}\n"
@@ -191,7 +166,6 @@ def format_markdown(inline_comments, messages, patchset_number, change_number):
     return md
 
 def format_text(inline_comments, messages, patchset_number, change_number):
-    """Return a plain-text formatted string with comments."""
     txt = f"Comments for Change {change_number}, Patchset {patchset_number}\n\n"
     filtered_messages = [m for m in messages if str(m.get("_revision_number")) == str(patchset_number)]
     if filtered_messages:
@@ -217,20 +191,64 @@ def format_text(inline_comments, messages, patchset_number, change_number):
     return txt
 
 # ----------------------------
-# Main function
+# VS Code Integration
+# ----------------------------
+def vscode_open_comments(inline_comments, patchset_number):
+    """
+    For each inline comment in the chosen patchset, list its file and line.
+    Then prompt the user to select one, and open that file in VS Code at that exact line.
+    """
+    comment_list = []
+    for file, comments in inline_comments.items():
+        for c in comments:
+            if str(c.get("patch_set")) == str(patchset_number):
+                line = c.get("line")
+                author = c.get("author", {}).get("name", "Unknown")
+                message = c.get("message", "")
+                comment_list.append((file, line, author, message))
+    if not comment_list:
+        print("No inline comments found for VS Code integration.")
+        return
+    print("\nInline Comments Found:")
+    for idx, (file, line, author, message) in enumerate(comment_list, start=1):
+        summary = message if len(message) < 50 else message[:50] + "..."
+        print(f"{idx}: {file} line {line} by {author} - {summary}")
+    choice = input("Enter comment number to open in VS Code (or press Enter to skip): ")
+    if not choice.strip():
+        return
+    try:
+        sel = int(choice)
+        if sel < 1 or sel > len(comment_list):
+            raise ValueError
+    except ValueError:
+        print("Invalid selection.")
+        return
+    file, line, author, message = comment_list[sel-1]
+    print(f"Opening {file} at line {line} in VS Code...")
+    try:
+        subprocess.run(["code", "--goto", f"{file}:{line}"])
+    except Exception as e:
+        print("Failed to open in VS Code:", e)
+
+# ----------------------------
+# Main Function
 # ----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Gerrit Comments Fetcher")
+    parser = argparse.ArgumentParser(description="Gerrit Comments Fetcher via SSH")
     parser.add_argument("--config", help="Path to config file (JSON)")
-    parser.add_argument("--method", choices=["rest", "ssh"], help="Method to use: rest or ssh")
+    parser.add_argument("--method", choices=["ssh", "rest"], default="ssh",
+                        help="Method to use (default: ssh)")
     parser.add_argument("--commit", help="Commit hash to use (default: HEAD)")
+    parser.add_argument("--query-mode", choices=["change-id", "commit"], default="change-id",
+                        help="Query by change-id (default) or by commit")
     parser.add_argument("--patchset", help="Patchset number to fetch", type=int)
-    parser.add_argument("--output-format", choices=["json", "markdown", "text"], nargs="+", default=["json"],
-                        help="Output formats (one or more)")
-    parser.add_argument("--vscode", action="store_true", help="Open output file in VS Code after generation")
+    parser.add_argument("--output-format", choices=["json", "markdown", "text"], nargs="+",
+                        default=["json"], help="Output format(s)")
+    parser.add_argument("--vscode", action="store_true",
+                        help="Open inline comments in VS Code at their exact file and line")
     args = parser.parse_args()
 
-    # Load configuration if provided
+    # Load configuration if provided.
     config = {}
     if args.config:
         if not os.path.exists(args.config):
@@ -242,30 +260,20 @@ def main():
             except Exception as e:
                 print("Error loading config:", e)
                 sys.exit(1)
-
-    # Get Gerrit config (or prompt if missing)
+    # Get Gerrit config (for SSH, expect ssh_host, ssh_user, ssh_port)
     gerrit_config = config.get("gerrit", {})
-    if not gerrit_config.get("base_url"):
-        base_url = input("Enter Gerrit base URL (e.g., https://gerrit.example.com): ").strip()
-        gerrit_config["base_url"] = base_url
+    gerrit_config.setdefault("method", args.method)
+    if gerrit_config["method"] == "ssh":
+        if not gerrit_config.get("ssh_host"):
+            gerrit_config["ssh_host"] = input("Enter Gerrit SSH host (e.g., gerrit.example.com): ").strip()
+        if not gerrit_config.get("ssh_user"):
+            gerrit_config["ssh_user"] = input("Enter Gerrit SSH username: ").strip()
+        if not gerrit_config.get("ssh_port"):
+            gerrit_config["ssh_port"] = input("Enter Gerrit SSH port (default 29418): ").strip() or "29418"
 
-    # Determine method: CLI flag, config, or default to REST.
-    if args.method:
-        method = args.method
-    else:
-        method = gerrit_config.get("method", "rest")
-    
-    # For REST, ensure username and password are provided.
-    if method == "rest":
-        if "username" not in gerrit_config:
-            gerrit_config["username"] = input("Enter Gerrit username: ").strip()
-        if "password" not in gerrit_config:
-            gerrit_config["password"] = getpass.getpass("Enter Gerrit HTTP password or API token: ")
-
-    # Get commit hash from Git (or use provided one)
+    # Get commit hash (default HEAD) and commit message
     commit_hash = args.commit if args.commit else get_current_commit()
     print("Using commit:", commit_hash)
-
     commit_message = get_commit_message(commit_hash)
     change_id = extract_change_id(commit_message)
     if not change_id:
@@ -273,30 +281,33 @@ def main():
         sys.exit(1)
     print("Found Change-Id:", change_id)
 
-    # Query Gerrit for the change using commit hash first
-    query_param = f"commit:{commit_hash}"
-    changes = query_change_rest(gerrit_config, query_param)
-    if not changes:
-        # Fallback: query using Change-Id if commit search fails
+    # Build query parameter based on query mode.
+    if args.query_mode == "change-id":
         query_param = f"Change-Id:{change_id}"
-        changes = query_change_rest(gerrit_config, query_param)
-    change_info = select_change(changes, change_id)
+    else:
+        query_param = f"commit:{commit_hash}"
+
+    # Use SSH method (default) to query Gerrit.
+    if gerrit_config["method"] == "ssh":
+        changes = query_change_ssh(gerrit_config, query_param)
+    else:
+        print("REST method not implemented; defaulting to SSH.")
+        changes = query_change_ssh(gerrit_config, query_param)
+
+    change_info = select_change(changes, query_param)
     change_number = change_info.get("_number")
     print(f"Found Gerrit change: {change_number} - {change_info.get('subject')}")
 
-    # Select patchset (either via CLI flag or prompt)
-    patchset_tuple = select_patchset(change_info, chosen_patchset=args.patchset)
-    patchset_number, revision_id, subject, created = patchset_tuple
-    print(f"Selected Patchset {patchset_number}: revision {revision_id[:7]}, subject: {subject}")
+    # Select patchset (by CLI flag or prompt)
+    ps = select_patchset(change_info, chosen_patchset=args.patchset)
+    patchset_number, revision_id, created = ps
+    print(f"Selected Patchset {patchset_number}: revision {revision_id[:7]}, created on: {created}")
 
-    # Fetch comments using the chosen method (currently REST)
-    if method == "rest":
-        inline_comments, messages = fetch_comments_rest(gerrit_config, change_number, revision_id)
-    else:
-        print("SSH method not implemented in this version.")
-        sys.exit(1)
+    # In SSH query, inline comments and messages are returned within the change info.
+    inline_comments = change_info.get("comments", {})
+    messages = change_info.get("messages", [])
 
-    # Format and save output in requested formats.
+    # Generate output files in the chosen format(s).
     for fmt in args.output_format:
         if fmt == "json":
             output = format_json(inline_comments, messages, patchset_number)
@@ -313,11 +324,10 @@ def main():
         with open(filename, "w", encoding="utf-8") as f:
             f.write(output)
         print(f"Output saved to {filename}")
-        if args.vscode:
-            try:
-                subprocess.run(["code", filename])
-            except Exception as e:
-                print("Failed to open file in VS Code:", e)
+
+    # VS Code Integration: Offer to open inline comments at their file and line.
+    if args.vscode:
+        vscode_open_comments(inline_comments, patchset_number)
 
 if __name__ == "__main__":
     main()
