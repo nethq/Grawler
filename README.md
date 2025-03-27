@@ -1,27 +1,15 @@
-How to Use This Script
+./script.py --json-file dump.json --patchset 3 --indent "    " --comment-syntax "//" --comment-fields "patchset,reviewer,message" --order oldest --diff-tool code
 
-1. Providing a Comments File:
-Pass your downloaded comments JSON with the argument
---load-comments downloaded_comments.json
-(Alternatively, use --json-file if you have the full Gerrit dump.)
+Usage Overview
 
+• Provide a JSON dump with --json-file dump.json or a saved comments file via --load-comments filename.json.
 
-2. Selecting a Patchset:
-If you do not provide --patchset, the script lists available patchsets and prompts you to enter one.
+• Specify (or be prompted for) the patchset number whose version you want to virtualize.
 
+• All operations occur in temporary folders; nothing is written to your working directory unless you use options to save outputs.
 
-3. Cloning vs. Git Regeneration:
-At runtime you’ll be asked whether to clone your working directory (which creates a temporary copy to annotate) or use Git (retrieving file content from the patchset’s revision) or just use the current file.
+• The script clones your working directory (if mode is “clone”) and checks out the patchset’s revision. Then, for every file with inline comments, it creates an annotated copy that appends comment lines (using the indent, comment syntax, and fields you specify) to the affected lines. The order of comment display (oldest first or latest first) is controlled with --order.
 
+• Finally, it launches VS Code’s diff view (using “code --diff”) to compare the annotated file against the current working file. You can navigate between diffs.
 
-4. Annotation & Diff:
-For every file that has inline comments (each comment must include “file”, “line”, “reviewer” with at least “name”, and “message”), the script edits the file content in the temporary clone (or in the generated content) by appending the comment text (preceded by a marker) to the line. It then launches VS Code’s diff view (using “code --diff”) comparing the annotated file (left) with your original file (right).
-The script does not alter any files in your working directory.
-
-
-5. Saving/Loading Comments and Summaries:
-Use --save-comments to write the downloaded comments to a file. Use --summary-file to save a summary for further parsing.
-
-
-6. Cleanup:
-By default, the temporary directories are removed once you press Enter. Use --no-cleanup to preserve them.
+• Temporary directories are cleaned up unless you specify --no-cleanup.
