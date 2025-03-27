@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
 """
-Gerrit Modular Diff Wrapper
+Gerrit Diff Wrapper
 
-This script processes a Gerrit JSON dump (or a saved comments file) and visualizes
-the corresponding file versions annotated with inline comments. It supports two modes:
-  (1) Directory mode – diff between a cached directory and the current working directory.
-  (2) Git regeneration mode – retrieve file versions from Git based on a patchset’s revision.
-It can save or load the grepped comments, and it launches VS Code’s diff view (or an alternative
-GUI diff tool) to show the annotated version versus the current file.
+This script processes a Gerrit JSON dump (or saved comments file) and visualizes the
+inline comments for a chosen patchset. It groups comments by file and, for each file,
+it produces an annotated copy (by appending comment text to the end of the affected line,
+thus not altering the line count) and launches VS Code’s diff view comparing that annotated
+file with the current working file. The script can operate in two modes:
+  • Clone mode: it copies your current working directory to a temporary location and uses that.
+  • Git mode: it regenerates file content from Git using the patchset’s revision.
+You may also save the downloaded comments to a file (and later load them), and no files
+are written in your working directory unless you explicitly request an output.
+
+Usage:
+  $ ./gerrit_diff_wrapper.py --json-file dump.json [options]
+
+Options:
+  --json-file PATH         Path to a Gerrit JSON dump.
+  --load-comments PATH     Path to a saved comments JSON file.
+  --save-comments PATH     Save the processed comments to this file.
+  --patchset NUM           Only use the specified patchset (if not provided, you’ll be prompted).
+  --file FILTER            Only process files whose names contain this substring.
+  --output-format FMT      Output summary format(s): json, markdown, text (default: json).
+  --summary-file PATH      Save the summary output to this file.
+  --vscode                 Use VS Code diff view (invokes "code --diff").
+  --mode MODE              "clone" to copy your working directory or "git" to use Git to regenerate file content.
+  --no-cleanup             Do not delete temporary directories (for debugging).
 """
 
 import argparse
@@ -18,20 +36,17 @@ import sys
 import tempfile
 import shutil
 
-def load_json_file(path):
-    """Load JSON data from a file. Exits on error."""
+def load_file(path):
     if not os.path.exists(path):
         sys.exit(f"Error: File '{path}' not found.")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        return content
+            return f.read().strip()
     except Exception as e:
-        sys.exit(f"Error reading file '{path}': {e}")
+        sys.exit(f"Error reading '{path}': {e}")
 
-def parse_gerrit_json_dump(path):
-    """Parse a Gerrit JSON dump and return the first valid change object."""
-    content = load_json_file(path)
+def parse_json_dump(path):
+    content = load_file(path)
     valid = []
     try:
         data = json.loads(content)
@@ -48,227 +63,256 @@ def parse_gerrit_json_dump(path):
             except json.JSONDecodeError:
                 continue
     if not valid:
-        sys.exit("Error: No valid Gerrit change object found in the JSON dump.")
+        sys.exit("Error: No valid change object found in JSON dump.")
     if len(valid) > 1:
         print("Warning: Multiple change objects found; using the first one.")
     return valid[0]
 
+def load_comments_json(path):
+    content = load_file(path)
+    try:
+        return json.loads(content)
+    except Exception as e:
+        sys.exit(f"Error parsing JSON from '{path}': {e}")
+
 def get_key(data, key, default=None):
-    """Retrieve a key from a dictionary, case-insensitively."""
     if key in data:
         return data[key]
-    lower_key = key.lower()
+    lk = key.lower()
     for k, v in data.items():
-        if k.lower() == lower_key:
+        if k.lower() == lk:
             return v
     return default
 
 def get_patchsets(data):
-    """Return a list of patch sets from the change object."""
     ps = get_key(data, "patchSets") or get_key(data, "patch_sets", [])
     return ps if isinstance(ps, list) else []
 
 def get_comments(data):
-    """Return a dictionary of inline comments from the change object."""
-    cm = get_key(data, "comments", {})
-    return cm if isinstance(cm, dict) else {}
+    cm = get_key(data, "comments")
+    if isinstance(cm, list):
+        return cm
+    return []
 
 def get_messages(data):
-    """Return a list of change messages from the change object."""
     ms = get_key(data, "messages", [])
     return ms if isinstance(ms, list) else []
 
-def get_patchset_revision(data, patchset_number):
-    """Return the revision (commit hash) for a given patchset number."""
+def get_patchset_revision(data, ps_num):
     for ps in get_patchsets(data):
-        if str(ps.get("number")) == str(patchset_number):
+        if str(ps.get("number")) == str(ps_num):
             return ps.get("revision")
     return None
 
-def save_comments_to_file(data, path):
-    """Save the full change object (or comments) to a file in JSON format."""
+def save_comments(data, path):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        print(f"Saved comments to '{path}'.")
+        print(f"Comments saved to '{path}'.")
     except Exception as e:
-        sys.exit(f"Error saving to '{path}': {e}")
+        sys.exit(f"Error saving comments to '{path}': {e}")
 
-def load_comments_from_file(path):
-    """Load a change object from a saved JSON file."""
-    content = load_json_file(path)
+def prompt_patchset(data, chosen):
+    ps_list = get_patchsets(data)
+    if not ps_list:
+        sys.exit("Error: No patchsets found in the JSON.")
+    if chosen:
+        for ps in ps_list:
+            if str(ps.get("number")) == str(chosen):
+                return str(ps.get("number"))
+        sys.exit(f"Error: Patchset {chosen} not found.")
+    print("Available patchsets:")
+    for ps in ps_list:
+        print(f"  Patchset {ps.get('number')} (revision: {str(ps.get('revision'))[:7]})")
+    sel = input("Enter patchset number: ").strip()
+    if not sel:
+        sys.exit("No patchset selected.")
+    return sel
+
+def group_comments_by_file(comments, ps_filter=None):
+    files = {}
+    for c in comments:
+        ps = c.get("patchset") or c.get("patchSet") or None
+        if ps_filter and ps is not None and str(ps) != str(ps_filter):
+            continue
+        f = c.get("file")
+        if not f:
+            continue
+        files.setdefault(f, []).append(c)
+    return files
+
+def clone_working_directory():
+    cwd = os.getcwd()
+    temp_dir = tempfile.mkdtemp(prefix="gerrit_clone_")
     try:
-        data = json.loads(content)
-        return data
+        shutil.copytree(cwd, os.path.join(temp_dir, "clone"), symlinks=True, dirs_exist_ok=True)
+        return os.path.join(temp_dir, "clone"), temp_dir
     except Exception as e:
-        sys.exit(f"Error parsing JSON from '{path}': {e}")
+        sys.exit(f"Error cloning working directory: {e}")
 
-def get_git_file_from_revision(revision, file_path):
-    """Retrieve file content from a given Git revision using 'git show'."""
+def annotate_lines(content, comments):
+    lines = content.splitlines()
+    line_map = {}
+    for c in comments:
+        ln = c.get("line")
+        if not ln:
+            continue
+        reviewer = c.get("reviewer", {}).get("name", "Unknown")
+        msg = c.get("message", "")
+        text = f" // [Gerrit] {reviewer}: {msg}"
+        line_map.setdefault(ln, []).append(text)
+    new_lines = []
+    for i, line in enumerate(lines, start=1):
+        if i in line_map:
+            # Append all comment texts without adding new lines
+            new_line = line + "".join(line_map[i])
+            new_lines.append(new_line)
+        else:
+            new_lines.append(line)
+    return "\n".join(new_lines) + "\n"
+
+def get_file_from_git(rev, file_path):
     try:
-        output = subprocess.check_output(["git", "show", f"{revision}:{file_path}"],
-                                           stderr=subprocess.STDOUT)
-        return output.decode("utf-8")
+        out = subprocess.check_output(["git", "show", f"{rev}:{file_path}"],
+                                      stderr=subprocess.STDOUT)
+        return out.decode("utf-8")
     except subprocess.CalledProcessError as e:
-        print(f"Error retrieving '{file_path}' from revision {revision}: {e.output.decode()}")
+        print(f"Error: retrieving '{file_path}' from revision {rev}: {e.output.decode()}")
         return None
 
-def annotate_content(content, comments, patchset_filter=None):
-    """Insert inline comment annotations into file content and return the annotated string."""
-    lines = content.splitlines()
-    ann_dict = {}
-    for comment in comments:
-        ps = comment.get("patchSet", comment.get("patch_set", "Unknown"))
-        if patchset_filter and str(ps) != str(patchset_filter):
-            continue
-        line_no = comment.get("line")
-        if not line_no:
-            continue
-        reviewer = comment.get("reviewer", {}).get("name", "Unknown")
-        msg = comment.get("message", "")
-        ann = f"[Patchset {ps}] {reviewer}: {msg}"
-        ann_dict.setdefault(line_no, []).append(ann)
-    annotated = []
-    for i, line in enumerate(lines, start=1):
-        annotated.append(line)
-        if i in ann_dict:
-            for a in ann_dict[i]:
-                annotated.append("  >>> " + a)
-    return "\n".join(annotated) + "\n"
-
-def diff_files(annotated_file, current_file, diff_tool="code"):
-    """Launch the diff tool to compare the annotated file with the current file."""
-    annotated_file = os.path.abspath(annotated_file)
-    current_file = os.path.abspath(current_file)
+def diff_in_vscode(annotated, original, diff_tool="code"):
+    annotated = os.path.abspath(annotated)
+    original = os.path.abspath(original)
     try:
-        result = subprocess.run([diff_tool, "--diff", annotated_file, current_file])
-        if result.returncode != 0:
-            print(f"Diff tool returned code {result.returncode} for '{current_file}'.")
+        subprocess.run([diff_tool, "--diff", annotated, original])
     except Exception as e:
-        print(f"Failed to launch diff tool for '{current_file}': {e}")
+        print(f"Error launching diff: {e}")
 
-def process_diffs(data, patchset_filter, file_filter, mode, diff_tool, temp_dir):
-    """For each file with comments, retrieve content, annotate it, and diff against target state."""
-    cached = {}
-    if mode == "directory":
-        target_dir = input("Enter the directory path to diff against: ").strip()
-        if not os.path.isdir(target_dir):
-            sys.exit("Error: Provided directory does not exist.")
-        cached["mode"] = "directory"
-    else:
-        cached["mode"] = "git"
-        if patchset_filter:
-            rev = get_patchset_revision(data, patchset_filter)
-            if not rev:
-                print(f"Warning: No revision found for patchset {patchset_filter}; using local files.")
-                cached["mode"] = "local"
-            else:
-                cached["rev"] = rev
-        else:
-            cached["mode"] = "local"
-    comments = get_comments(data)
+def process_files(data, ps_filter, file_filter, mode, diff_tool, clone_dir=None, temp_dir=None):
+    all_comments = get_comments(data)
+    files_comments = group_comments_by_file(all_comments, ps_filter)
     if file_filter:
-        comments = {f: cs for f, cs in comments.items() if file_filter in f}
-    if not comments:
-        print("No inline comments found.")
+        files_comments = {f: cs for f, cs in files_comments.items() if file_filter in f}
+    if not files_comments:
+        print("No inline comments found for the selected patchset/file filter.")
         return
-    for file_path, comm_list in comments.items():
-        if patchset_filter:
-            filtered = [c for c in comm_list if str(c.get("patchSet", c.get("patch_set"))) == str(patchset_filter)]
-            if not filtered:
-                continue
-        else:
-            filtered = comm_list
-        if cached.get("mode") == "git":
-            content = get_git_file_from_revision(cached["rev"], file_path)
+    if mode == "git":
+        rev = get_patchset_revision(data, ps_filter)
+        if not rev:
+            print(f"Warning: No revision found for patchset {ps_filter}; skipping git mode.")
+            mode = "local"
+    for f, comms in files_comments.items():
+        if mode == "git":
+            content = get_file_from_git(rev, f)
             if content is None:
-                print(f"Skipping file '{file_path}' due to retrieval error.")
+                print(f"Skipping file '{f}' (unable to retrieve from git).")
                 continue
-        elif cached.get("mode") == "directory":
-            target_file = os.path.join(target_dir, file_path)
-            if not os.path.exists(target_file):
-                print(f"File '{file_path}' not found in directory '{target_dir}'.")
+        elif mode == "clone":
+            clone_file = os.path.join(clone_dir, f)
+            if not os.path.exists(clone_file):
+                print(f"File '{f}' not found in cloned directory.")
                 continue
             try:
-                with open(target_file, "r", encoding="utf-8") as f:
-                    content = f.read()
+                with open(clone_file, "r", encoding="utf-8") as fp:
+                    content = fp.read()
             except Exception as e:
-                print(f"Error reading '{target_file}': {e}")
+                print(f"Error reading cloned file '{f}': {e}")
                 continue
         else:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except Exception as e:
-                print(f"File '{file_path}' not found locally: {e}")
+            if not os.path.exists(f):
+                print(f"File '{f}' not found locally.")
                 continue
-        annotated = annotate_content(content, filtered, patchset_filter)
-        temp_file = os.path.join(temp_dir, os.path.basename(file_path) + ".annotated")
+            try:
+                with open(f, "r", encoding="utf-8") as fp:
+                    content = fp.read()
+            except Exception as e:
+                print(f"Error reading file '{f}': {e}")
+                continue
+        annotated_content = annotate_lines(content, comms)
+        annotated_temp = os.path.join(temp_dir, os.path.basename(f) + ".annotated")
         try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                f.write(annotated)
+            with open(annotated_temp, "w", encoding="utf-8") as fp:
+                fp.write(annotated_content)
         except Exception as e:
-            print(f"Error writing temporary file for '{file_path}': {e}")
+            print(f"Error writing annotated file for '{f}': {e}")
             continue
-        diff_files(temp_file, file_path, diff_tool)
+        # Launch VS Code diff between the annotated version and the current working file.
+        if os.path.exists(f):
+            diff_in_vscode(annotated_temp, f, diff_tool)
+        else:
+            print(f"Original file '{f}' not found for diffing.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Gerrit Modular Diff Wrapper")
-    parser.add_argument("--json-file", help="Path to Gerrit JSON dump", required=False)
-    parser.add_argument("--load-comments", help="Path to saved comments file", required=False)
-    parser.add_argument("--save-comments", help="Path to save grepped comments", required=False)
-    parser.add_argument("--patchset", help="Filter by patchset number", type=str)
+    parser = argparse.ArgumentParser(description="Gerrit Diff Wrapper (Modular, Connectionless)")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--json-file", help="Path to Gerrit JSON dump")
+    group.add_argument("--load-comments", help="Path to saved comments file")
+    parser.add_argument("--save-comments", help="Save downloaded comments to file")
+    parser.add_argument("--patchset", help="Patchset number to select", type=str)
     parser.add_argument("--file", help="Filter by file name substring", type=str)
     parser.add_argument("--output-format", choices=["json", "markdown", "text"], nargs="+", default=["json"])
-    parser.add_argument("--summary-file", help="File to save summary output", type=str)
+    parser.add_argument("--summary-file", help="File to save summary output")
+    parser.add_argument("--vscode", action="store_true", help="Launch diffs in VS Code (using 'code --diff')")
+    parser.add_argument("--mode", choices=["clone", "git", "local"], help="Diff mode: 'clone' to clone working dir, 'git' to use git revision, 'local' to use current files", required=False)
     parser.add_argument("--diff-tool", default="code", help="Diff tool executable (default: code)")
-    parser.add_argument("--mode", choices=["directory", "git"], help="Diff mode: compare against a directory or use git tree", required=False)
-    parser.add_argument("--no-cleanup", action="store_true", help="Do not delete temporary files")
+    parser.add_argument("--no-cleanup", action="store_true", help="Do not delete temporary directories")
     args = parser.parse_args()
-    data = None
+
     if args.load_comments:
-        data = load_comments_from_file(args.load_comments)
-    elif args.json_file:
-        data = parse_gerrit_json_dump(args.json_file)
+        data = load_comments_json(args.load_comments)
     else:
-        sys.exit("Error: You must specify either --json-file or --load-comments.")
+        data = parse_json_dump(args.json_file)
     if args.save_comments:
-        save_comments_to_file(data, args.save_comments)
+        save_comments(data, args.save_comments)
+    # Output summaries
     summaries = {}
     for fmt in args.output_format:
         if fmt == "json":
-            summaries["json"] = format_summary_json(data, args.patchset, args.file)
+            summaries["json"] = json.dumps(data, indent=2)
         elif fmt == "markdown":
-            summaries["markdown"] = format_summary_markdown(data, args.patchset, args.file)
+            # Minimal markdown summary: patchset and number of comments.
+            summaries["markdown"] = f"# Gerrit Change Summary\nPatchsets: {get_patchsets(data)}\nComments count: {len(get_comments(data))}"
         elif fmt == "text":
-            summaries["text"] = format_summary_text(data, args.patchset, args.file)
+            summaries["text"] = f"Gerrit Change Summary\nPatchsets: {get_patchsets(data)}\nComments count: {len(get_comments(data))}"
     for fmt, summ in summaries.items():
         print(f"\n--- {fmt.upper()} SUMMARY ---\n{summ}\n")
     if args.summary_file:
         try:
             with open(args.summary_file, "w", encoding="utf-8") as f:
                 for fmt, summ in summaries.items():
-                    f.write(f"--- {fmt.upper()} SUMMARY ---\n\n{summ}\n\n")
-            print(f"Summary saved to {args.summary_file}")
+                    f.write(f"--- {fmt.upper()} SUMMARY ---\n{summ}\n\n")
+            print(f"Summary saved to '{args.summary_file}'.")
         except Exception as e:
             print(f"Error writing summary file: {e}")
-    if not args.mode:
-        choice = input("Diff mode: [1] Directory, [2] Git tree regeneration. Enter 1 or 2: ").strip()
+    selected_ps = args.patchset if args.patchset else prompt_patchset(data, None)
+    mode = args.mode
+    if not mode:
+        choice = input("Choose diff mode: [1] Clone working dir, [2] Git revision, [3] Local current file. Enter 1, 2, or 3: ").strip()
         if choice == "1":
-            mode = "directory"
-        else:
+            mode = "clone"
+        elif choice == "2":
             mode = "git"
-    else:
-        mode = args.mode
-    with tempfile.TemporaryDirectory() as temp_dir:
-        print(f"Using temporary directory: {temp_dir}")
-        process_diffs(data, args.patchset, args.file, mode, args.diff_tool, temp_dir)
-        if args.no_cleanup:
-            preserve = os.path.join(os.getcwd(), "gerrit_temp_preserved")
-            shutil.copytree(temp_dir, preserve)
-            print(f"Temporary files preserved at: {preserve}")
         else:
-            input("Press Enter to finish and clean up temporary files...")
+            mode = "local"
+    clone_dir = None
+    temp_root = tempfile.mkdtemp(prefix="gerrit_diff_")
+    if mode == "clone":
+        print("Cloning current working directory...")
+        clone_dir, clone_temp = clone_working_directory()
+        print(f"Working directory cloned to '{clone_dir}'.")
+    try:
+        process_files(data, selected_ps, args.file, mode, args.diff_tool, clone_dir, temp_root)
+    except Exception as e:
+        print(f"Error processing diffs: {e}")
+    if args.no_cleanup:
+        preserved = os.path.join(os.getcwd(), "gerrit_temp_preserved")
+        shutil.copytree(temp_root, preserved)
+        print(f"Temporary files preserved at '{preserved}'.")
+    else:
+        input("Press Enter to clean up temporary files and exit...")
+        shutil.rmtree(temp_root, ignore_errors=True)
+        if mode == "clone" and clone_dir:
+            shutil.rmtree(os.path.dirname(clone_dir), ignore_errors=True)
 
 if __name__ == "__main__":
     main()
